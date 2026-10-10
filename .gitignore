@@ -1,0 +1,4 @@
+/gitsnow
+/internal/web/dist/
+/web/node_modules/
+*.tsbuildinfo
