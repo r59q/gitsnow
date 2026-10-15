@@ -159,3 +159,15 @@ func TestRejectsChangedRepository(t *testing.T) {
 		t.Fatal("rejected request created an issue")
 	}
 }
+
+func TestSharingStatusAndRetry(t *testing.T) {
+	handler := testAPI(t)
+	response := request(handler, "GET", "/api/repository", "")
+	if response.Code != 200 || !strings.Contains(response.Body.String(), `"state":"local_only"`) {
+		t.Fatalf("missing explicit local-only status: %d %s", response.Code, response.Body.String())
+	}
+	response = request(handler, "POST", "/api/sync", "")
+	if response.Code != 202 || !strings.Contains(response.Body.String(), `"state":"local_only"`) {
+		t.Fatalf("retry claimed shared without a remote: %d %s", response.Code, response.Body.String())
+	}
+}

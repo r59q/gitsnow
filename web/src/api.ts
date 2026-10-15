@@ -12,6 +12,16 @@ export interface Repository {
   path: string;
   metadataRef: string;
   backend: string;
+  sync?: SyncStatus;
+}
+
+export interface SyncStatus {
+  state: "local_only" | "pending" | "syncing" | "synced" | "error" | "conflict";
+  remote: string;
+  message: string;
+  conflicts?: string[];
+  lastSuccess?: string;
+  syncedRevision?: string;
 }
 
 export interface IssueInput {
@@ -57,8 +67,20 @@ function isRepository(value: unknown): value is Repository {
     isRecord(value) &&
     typeof value.path === "string" &&
     typeof value.metadataRef === "string" &&
-    value.backend === "git"
+    value.backend === "git" &&
+    (value.sync === undefined || isSyncStatus(value.sync))
   );
+}
+
+function isSyncStatus(value: unknown): value is SyncStatus {
+  return isRecord(value) &&
+    typeof value.state === "string" &&
+    ["local_only", "pending", "syncing", "synced", "error", "conflict"].includes(value.state) &&
+    typeof value.remote === "string" &&
+    typeof value.message === "string" &&
+    (value.lastSuccess === undefined || typeof value.lastSuccess === "string") &&
+    (value.syncedRevision === undefined || typeof value.syncedRevision === "string") &&
+    (value.conflicts === undefined || (Array.isArray(value.conflicts) && value.conflicts.every((path) => typeof path === "string")));
 }
 
 async function request(path: string, options?: RequestInit): Promise<unknown> {
@@ -84,6 +106,14 @@ async function request(path: string, options?: RequestInit): Promise<unknown> {
 export async function getRepository(signal: AbortSignal): Promise<Repository> {
   const value = await request("/api/repository", { signal });
   if (!isRepository(value)) throw new Error("The daemon returned invalid repository information");
+  return value;
+}
+
+export async function requestSync(repositoryPath: string): Promise<SyncStatus> {
+  const value = await request("/api/sync", {
+    method: "POST", headers: { "X-Gitsnow-Repository": repositoryPath },
+  });
+  if (!isSyncStatus(value)) throw new Error("The daemon returned invalid sharing status");
   return value;
 }
 
@@ -140,7 +170,7 @@ export function writeCache(snapshot: Snapshot): string | undefined {
   try {
     localStorage.setItem(cacheKey, JSON.stringify(snapshot));
   } catch (error) {
-    return `Changes are saved to Git, but browser caching is unavailable: ${errorMessage(error)}`;
+    return `Changes are saved locally, but browser caching is unavailable: ${errorMessage(error)}`;
   }
 }
 

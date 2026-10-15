@@ -26,9 +26,26 @@ func New(store *issues.Store, assets fs.FS, logger *slog.Logger) http.Handler {
 	api := &API{store: store, logger: logger}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/repository", func(w http.ResponseWriter, r *http.Request) {
-		api.respond(w, http.StatusOK, map[string]string{
-			"path": store.Root(), "metadataRef": issues.MetadataRef, "backend": "git",
+		status, err := store.SyncStatus(r.Context())
+		if err != nil {
+			api.handleError(w, err)
+			return
+		}
+		api.respond(w, http.StatusOK, map[string]any{
+			"path": store.Root(), "metadataRef": issues.MetadataRef, "backend": "git", "sync": status,
 		})
+	})
+	mux.HandleFunc("POST /api/sync", func(w http.ResponseWriter, r *http.Request) {
+		status, err := store.SyncStatus(r.Context())
+		if err != nil {
+			api.handleError(w, err)
+			return
+		}
+		store.RequestSync()
+		if status.Remote != "" && status.State != "syncing" {
+			status.State, status.Message = "pending", "Synchronization requested; local changes are safe"
+		}
+		api.respond(w, http.StatusAccepted, status)
 	})
 	mux.HandleFunc("GET /api/issues", api.list)
 	mux.HandleFunc("POST /api/issues", api.create)

@@ -43,6 +43,10 @@ h1 { font-size: 34px; letter-spacing: -1px; margin: 0 0 8px; font-weight: 650; }
 .message.error { background: #fff0ee; color: #932c31; border: 1px solid #f1c8c5; }
 .message.warning { background: #fff7dd; color: #745719; border: 1px solid #eaddb6; }
 .message.success { background: #e9f5ed; color: #28613c; border: 1px solid #cfe5d5; }
+.message.sharing { background: #f1f5f0; color: #496653; border: 1px solid var(--border); }
+.message.sharing strong, .message.warning strong, .message.success strong { display: block; margin-bottom: 3px; }
+.message > button { flex-shrink: 0; }
+.conflict-paths { margin-top: 6px; font-family: monospace; font-size: 11px; }
 .issue-board { border: 1px solid var(--border); border-radius: 12px; background: #fff; box-shadow: 0 2px 10px #1b352006; overflow: hidden; }
 .board-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 18px; border-bottom: 1px solid var(--border); }
 .filters { display: flex; gap: 3px; }

@@ -51,6 +51,14 @@ func openRepository(ctx context.Context, path string) (repository, error) {
 }
 
 func (r repository) git(ctx context.Context, input []byte, args ...string) ([]byte, error) {
+	return r.runGit(ctx, input, false, args...)
+}
+
+func (r repository) networkGit(ctx context.Context, args ...string) ([]byte, error) {
+	return r.runGit(ctx, nil, true, args...)
+}
+
+func (r repository) runGit(ctx context.Context, input []byte, network bool, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", r.root}, args...)...)
 	for _, variable := range os.Environ() {
 		if !strings.HasPrefix(variable, "GIT_") {
@@ -61,6 +69,14 @@ func (r repository) git(ctx context.Context, input []byte, args ...string) ([]by
 		"GIT_AUTHOR_NAME=gitsnow", "GIT_AUTHOR_EMAIL=gitsnow@localhost",
 		"GIT_COMMITTER_NAME=gitsnow", "GIT_COMMITTER_EMAIL=gitsnow@localhost",
 		"GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1")
+	if network {
+		ssh := os.Getenv("GIT_SSH_COMMAND")
+		if ssh == "" {
+			ssh = "ssh -oBatchMode=yes -oConnectTimeout=10"
+		}
+		cmd.Env = append(cmd.Env, "GIT_SSH_COMMAND="+ssh)
+	}
+	cmd.WaitDelay = time.Second
 	cmd.Stdin = bytes.NewReader(input)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -72,26 +88,44 @@ func (r repository) git(ctx context.Context, input []byte, args ...string) ([]by
 }
 
 func (r repository) head(ctx context.Context) (string, error) {
-	output, err := r.git(ctx, nil, "show-ref", "--verify", "--hash", MetadataRef)
+	return r.refHead(ctx, MetadataRef)
+}
+
+func (r repository) refHead(ctx context.Context, ref string) (string, error) {
+	output, err := r.git(ctx, nil, "show-ref", "--verify", "--hash", ref)
 	if err != nil {
 		// show-ref --exists distinguishes an absent ref from a broken repository.
-		_, existsErr := r.git(ctx, nil, "show-ref", "--exists", MetadataRef)
+		_, existsErr := r.git(ctx, nil, "show-ref", "--exists", ref)
 		var exit *exec.ExitError
 		if errors.As(existsErr, &exit) && exit.ExitCode() == 2 {
-			remotes, err := r.git(ctx, nil, "for-each-ref", "--format=%(refname)", "refs/remotes/")
-			if err != nil {
-				return "", err
-			}
-			for _, ref := range strings.Fields(string(remotes)) {
-				if strings.HasSuffix(ref, "/gitsnow/meta") {
-					return "", fmt.Errorf("local gitsnow/meta branch is missing, but %s exists; create a local tracking branch before using gitsnow", ref)
-				}
-			}
 			return "", nil
 		}
 		return "", err
 	}
 	return strings.TrimSpace(string(output)), nil
+}
+
+func (r repository) records(ctx context.Context, head string) ([]Issue, error) {
+	_, entries, err := r.issueEntries(ctx, head)
+	if err != nil {
+		return nil, err
+	}
+	records := []Issue{}
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.name, ".md") {
+			return nil, fmt.Errorf("unexpected file in metadata issues directory: %s", entry.name)
+		}
+		data, err := r.git(ctx, nil, "cat-file", "blob", entry.hash)
+		if err != nil {
+			return nil, err
+		}
+		issue, err := decodeIssue(data, entry)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, issue)
+	}
+	return records, nil
 }
 
 func (r repository) tree(ctx context.Context, ref string) ([]treeEntry, error) {
@@ -196,7 +230,23 @@ func replaceEntry(entries []treeEntry, name string, replacement *treeEntry) []tr
 	return result
 }
 
+func (r repository) ensureMetadataDetached(ctx context.Context) error {
+	output, err := r.git(ctx, nil, "worktree", "list", "--porcelain", "-z")
+	if err != nil {
+		return err
+	}
+	for _, field := range bytes.Split(output, []byte{0}) {
+		if string(field) == "branch "+MetadataRef {
+			return &ValidationError{"gitsnow/meta is checked out in a worktree; finish reconciliation and remove that worktree before using managed issue writes or synchronization"}
+		}
+	}
+	return nil
+}
+
 func (r repository) commitIssue(ctx context.Context, oldHead string, issue Issue, remove bool) (string, string, error) {
+	if err := r.ensureMetadataDetached(ctx); err != nil {
+		return "", "", err
+	}
 	root, entries, err := r.issueEntries(ctx, oldHead)
 	if err != nil {
 		return "", "", err

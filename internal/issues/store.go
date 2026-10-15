@@ -16,9 +16,11 @@ import (
 )
 
 type Store struct {
-	mu   sync.Mutex
-	repo repository
-	db   *sql.DB
+	mu      sync.Mutex
+	syncMu  sync.Mutex
+	repo    repository
+	db      *sql.DB
+	changes chan struct{}
 }
 
 func Open(ctx context.Context, path string) (*Store, error) {
@@ -34,7 +36,11 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, fmt.Errorf("open issue index: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-	store := &Store{repo: repo, db: db}
+	store := &Store{repo: repo, db: db, changes: make(chan struct{}, 1)}
+	if err := repo.bootstrapMetadata(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err := store.initialize(ctx); err != nil {
 		db.Close()
 		return nil, err
@@ -86,24 +92,9 @@ func (s *Store) refresh(ctx context.Context) (string, error) {
 	if err == nil && head == cached {
 		return head, nil
 	}
-	_, entries, err := s.repo.issueEntries(ctx, head)
+	records, err := s.repo.records(ctx, head)
 	if err != nil {
 		return "", err
-	}
-	var records []Issue
-	for _, entry := range entries {
-		if !strings.HasSuffix(entry.name, ".md") {
-			return "", fmt.Errorf("unexpected file in metadata issues directory: %s", entry.name)
-		}
-		data, err := s.repo.git(ctx, nil, "cat-file", "blob", entry.hash)
-		if err != nil {
-			return "", err
-		}
-		issue, err := decodeIssue(data, entry)
-		if err != nil {
-			return "", err
-		}
-		records = append(records, issue)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -300,6 +291,7 @@ func (s *Store) save(ctx context.Context, oldHead string, issue Issue, remove bo
 	if err != nil {
 		return Issue{}, err
 	}
+	s.RequestSync()
 	issue.Revision = revision
 	if err := s.updateIndex(ctx, oldHead, head, issue, remove); err != nil {
 		return Issue{}, fmt.Errorf("metadata was saved to Git, but updating the local index failed; reload to reconcile: %w", err)

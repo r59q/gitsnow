@@ -24,7 +24,8 @@ import (
 const usage = `gitsnow: local-first repository management
 
 Usage:
-  gitsnow serve [--repo PATH] [--listen 127.0.0.1:7331]
+  gitsnow serve [--repo PATH] [--listen 127.0.0.1:7331] [--sync-interval 15s]
+  gitsnow sync [--repo PATH] [--remote NAME|off]
   gitsnow issue list [--repo PATH] [--status open|closed] [--search TEXT]
   gitsnow issue create [--repo PATH] --title TITLE [--body TEXT] [--id ID]
   gitsnow issue show [--repo PATH] ID
@@ -33,6 +34,8 @@ Usage:
 
 Issue commands return JSON and operate directly on Git; no daemon is required.
 Place flags before the issue ID. Metadata lives on the gitsnow/meta branch.
+Metadata is shared automatically through origin when it exists. Select a
+different remote or disable sharing with gitsnow sync --remote NAME|off.
 `
 
 func main() {
@@ -51,6 +54,9 @@ func run(ctx context.Context, args []string, output, errorOutput io.Writer) erro
 	}
 	if args[0] == "serve" {
 		return serve(ctx, args[1:], errorOutput)
+	}
+	if args[0] == "sync" {
+		return syncMetadata(ctx, args[1:], output, errorOutput)
 	}
 	if args[0] != "issue" || len(args) < 2 {
 		return fmt.Errorf("unknown command; run gitsnow --help")
@@ -95,13 +101,18 @@ func run(ctx context.Context, args []string, output, errorOutput io.Writer) erro
 	if command == "delete" && *revision == "" {
 		return fmt.Errorf("delete requires --revision from issue show")
 	}
-	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	store, err := issues.Open(ctx, *repo)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
+	if command == "list" || command == "show" {
+		if _, err := store.Sync(ctx); err != nil {
+			fmt.Fprintln(errorOutput, "gitsnow: could not fetch shared metadata; showing local records:", err)
+		}
+	}
 	var result any
 	switch command {
 	case "list":
@@ -139,7 +150,51 @@ func run(ctx context.Context, args []string, output, errorOutput io.Writer) erro
 	}
 	encoder := json.NewEncoder(output)
 	encoder.SetIndent("", "  ")
-	return encoder.Encode(result)
+	if err := encoder.Encode(result); err != nil {
+		return err
+	}
+	if command == "create" || command == "update" || command == "delete" {
+		status, err := store.Sync(ctx)
+		if err != nil {
+			return fmt.Errorf("issue change saved locally, but not shared (will retry while the daemon runs): %w", err)
+		}
+		fmt.Fprintln(errorOutput, "gitsnow:", status.Message)
+	}
+	return nil
+}
+
+func syncMetadata(ctx context.Context, args []string, output, errorOutput io.Writer) error {
+	flags := flag.NewFlagSet("sync", flag.ContinueOnError)
+	flags.SetOutput(errorOutput)
+	repo := flags.String("repo", ".", "Git working repository")
+	remote := flags.String("remote", "", "Persist a synchronization remote name, or off for local-only mode")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("sync does not accept positional arguments")
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	configure := false
+	flags.Visit(func(f *flag.Flag) { configure = configure || f.Name == "remote" })
+	if configure {
+		if err := issues.ConfigureSync(ctx, *repo, *remote); err != nil {
+			return err
+		}
+	}
+	store, err := issues.Open(ctx, *repo)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	status, syncErr := store.Sync(ctx)
+	encoder := json.NewEncoder(output)
+	encoder.SetIndent("", "  ")
+	return errors.Join(syncErr, encoder.Encode(status))
 }
 
 func serve(ctx context.Context, args []string, output io.Writer) error {
@@ -147,6 +202,7 @@ func serve(ctx context.Context, args []string, output io.Writer) error {
 	flags.SetOutput(output)
 	repo := flags.String("repo", ".", "Git working repository")
 	listen := flags.String("listen", "127.0.0.1:7331", "Loopback address for local UI and API")
+	syncInterval := flags.Duration("sync-interval", 15*time.Second, "Automatic metadata fetch/retry interval (minimum 1s)")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -155,6 +211,9 @@ func serve(ctx context.Context, args []string, output io.Writer) error {
 	}
 	if flags.NArg() != 0 {
 		return fmt.Errorf("serve does not accept positional arguments")
+	}
+	if *syncInterval < time.Second {
+		return fmt.Errorf("--sync-interval must be at least 1s")
 	}
 	if host, _, err := net.SplitHostPort(*listen); err != nil || !server.LoopbackHost(host) {
 		return fmt.Errorf("--listen must be a loopback host:port; remote hosting is not enabled")
@@ -179,6 +238,18 @@ func serve(ctx context.Context, args []string, output io.Writer) error {
 		return fmt.Errorf("resolved listener is not loopback")
 	}
 	logger := slog.New(slog.NewTextHandler(output, nil))
+	syncContext, stopSync := context.WithCancel(ctx)
+	syncDone := make(chan struct{})
+	go func() {
+		defer close(syncDone)
+		store.RunSync(syncContext, *syncInterval, func(err error) {
+			logger.Error("metadata synchronization failed; local changes are preserved", "error", err)
+		})
+	}()
+	defer func() {
+		stopSync()
+		<-syncDone
+	}()
 	httpServer := &http.Server{
 		Handler: server.New(store, assets, logger), ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second,

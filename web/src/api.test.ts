@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { listIssues, readCache } from "./api";
+import { getRepository, listIssues, readCache } from "./api";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -20,4 +20,12 @@ it("binds issue snapshots to the repository that was verified", async () => {
   vi.stubGlobal("fetch", fetch);
   expect(await listIssues(new AbortController().signal, "/work/repository")).toEqual([]);
   expect(fetch.mock.calls[0][1].headers).toMatchObject({ "X-Gitsnow-Repository": "/work/repository" });
+});
+
+it("rejects invalid sharing state from the daemon", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+    path: "/repo", metadataRef: "refs/heads/gitsnow/meta", backend: "git",
+    sync: { state: "silently-shared", remote: "origin", message: "Not a valid state" },
+  }), { status: 200 })));
+  await expect(getRepository(new AbortController().signal)).rejects.toThrow("invalid repository information");
 });

@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
-import { isRecord, writeCache } from "./api";
+import { isRecord, readCache, writeCache } from "./api";
 import type { Issue, Repository } from "./api";
 
 const repository: Repository = { path: "/work/example", metadataRef: "refs/heads/gitsnow/meta", backend: "git" };
@@ -49,13 +49,13 @@ describe("issue workflow", () => {
     await user.click(within(dialog).getByRole("button", { name: "Save issue" }));
     expect(screen.getByText("Mobile workflow")).toBeInTheDocument();
     expect(screen.getByText("Pending")).toBeInTheDocument();
-    expect(screen.queryByText("Issue saved to Git.")).not.toBeInTheDocument();
+    expect(screen.queryByText("Issue saved locally.")).not.toBeInTheDocument();
     const call = fetch.mock.calls[2];
     const submitted: unknown = JSON.parse(call[1].body);
     expect(submitted).toMatchObject({ title: "Mobile workflow", status: "open" });
     if (!isRecord(submitted)) throw new Error("Invalid create payload");
     confirm?.(response({ ...issue, ...submitted }, 201));
-    expect(await screen.findByText("Issue saved to Git.")).toBeInTheDocument();
+    expect(await screen.findByText("Issue saved locally.")).toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(screen.queryByText("Pending")).not.toBeInTheDocument();
   });
@@ -141,8 +141,66 @@ describe("issue workflow", () => {
     expect(screen.getByRole("button", { name: "Save issue" })).toBeDisabled();
     await user.click(apply);
     await user.click(screen.getByRole("button", { name: "Save issue" }));
-    expect(await screen.findByText("Issue saved to Git.")).toBeInTheDocument();
+    expect(await screen.findByText("Issue saved locally.")).toBeInTheDocument();
     expect(JSON.parse(fetch.mock.calls[5][1].body)).toMatchObject({ title: "My draft", revision: latest.revision });
     expect(fetch.mock.calls[5][1].headers).toMatchObject({ "X-Gitsnow-Repository": repository.path });
+  });
+
+  it("distinguishes confirmed local saves from remote sharing, including in the browser cache", async () => {
+    const user = userEvent.setup();
+    const sharedRepository: Repository = {
+      ...repository,
+      sync: { state: "synced", remote: "origin", message: "Shared with origin" },
+    };
+    const fetch = vi.fn().mockResolvedValueOnce(response(sharedRepository))
+      .mockResolvedValueOnce(response({ issues: [issue] }))
+      .mockResolvedValueOnce(response({ ...issue, title: "Not published yet", revision: "c".repeat(40) }));
+    vi.stubGlobal("fetch", fetch);
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: /An existing issue/ }));
+    const title = within(screen.getByRole("dialog")).getByLabelText(/^Title/);
+    await user.clear(title);
+    await user.type(title, "Not published yet");
+    await user.click(screen.getByRole("button", { name: "Save issue" }));
+    expect(await screen.findByText("Issue saved locally. Remote sharing is tracked below.")).toBeInTheDocument();
+    expect(screen.getByText("Sharing pending")).toBeInTheDocument();
+    expect(screen.queryByText("Shared with origin")).not.toBeInTheDocument();
+    expect(readCache().snapshot?.repository.sync?.state).toBe("pending");
+    expect(readCache().snapshot?.issues[0].title).toBe("Not published yet");
+  });
+
+  it("shows remote failure without disabling local issue creation, and queues a sharing retry", async () => {
+    const user = userEvent.setup();
+    const blockedRepository: Repository = {
+      ...repository,
+      sync: { state: "error", remote: "origin", message: "Not shared: remote unreachable. Local changes are safe." },
+    };
+    const fetch = vi.fn().mockResolvedValueOnce(response(blockedRepository))
+      .mockResolvedValueOnce(response({ issues: [issue] }))
+      .mockResolvedValueOnce(response({ state: "pending", remote: "origin", message: "Synchronization requested" }, 202));
+    vi.stubGlobal("fetch", fetch);
+    render(<App />);
+    expect(await screen.findByText("Not shared: remote unreachable. Local changes are safe.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "+ New issue" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "Retry sharing" }));
+    expect(await screen.findByText("Synchronization requested")).toBeInTheDocument();
+    expect(fetch.mock.calls[2][0]).toBe("/api/sync");
+    expect(fetch.mock.calls[2][1]).toMatchObject({ method: "POST", headers: { "X-Gitsnow-Repository": repository.path } });
+  });
+
+  it("lists conflicting issue paths without claiming they were published", async () => {
+    const conflicted: Repository = {
+      ...repository,
+      sync: {
+        state: "conflict", remote: "origin", message: "Not shared: conflicting edits. Both versions are preserved.",
+        conflicts: ["issues/" + issue.id + ".md"],
+      },
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(response(conflicted))
+      .mockResolvedValueOnce(response({ issues: [issue] })));
+    render(<App />);
+    expect(await screen.findByText("issues/" + issue.id + ".md")).toBeInTheDocument();
+    expect(screen.getByText("Saved locally / not shared")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "+ New issue" })).toBeEnabled();
   });
 });

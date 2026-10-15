@@ -3,8 +3,8 @@
 Local-first repository management, designed to connect issues, agent workers,
 and code review without depending on a particular Git hosting platform.
 
-**Current milestone:** Git-backed issue CRUD, a CLI, a localhost daemon, and a
-responsive React UI. Agent execution, change requests, projects, comments,
+**Current milestone:** Git-backed issue CRUD, automatic metadata sharing, a CLI,
+a localhost daemon, and a responsive React UI. Agent execution, change requests, projects, comments,
 workflows, forge adapters, and authenticated remote hosting are **not implemented
 yet**.
 
@@ -21,6 +21,18 @@ make build
 Open **http://127.0.0.1:7331**. The binary embeds the production UI; Node.js is
 only required at build time. The repository can be newly initialized and have
 no application commits.
+
+If the repository has an **`origin` remote**, gitsnow automatically shares its
+metadata branch using your existing Git credentials. Co-workers can run gitsnow
+against their own clones to receive issues without creating or pushing a metadata
+branch themselves. Only `gitsnow/meta` is published, never application branches
+or tags. Repositories without `origin` stay local-only.
+
+To opt out before starting the daemon:
+
+```sh
+./gitsnow sync --repo /path/to/repo --remote off
+```
 
 The daemon binds to loopback only. Do not expose it through a public reverse
 proxy: authentication and remote-hosting authorization are not implemented.
@@ -42,6 +54,12 @@ Issue commands operate directly on Git, without a running daemon, and return JSO
 ./gitsnow issue update --repo /path/to/repo --status closed ISSUE_ID
 ./gitsnow issue delete --repo /path/to/repo --revision REVISION ISSUE_ID
 ```
+
+Reads attempt to fetch shared metadata first; writes save locally and then
+attempt to share. A failed write synchronization returns the saved record on
+stdout and a nonzero exit with an explicit **saved locally, but not shared**
+message. Retain its ID before retrying creation. Reads remain available offline,
+with a warning on stderr that local records are being shown.
 
 Place flags before the issue ID. `show` returns the full ID and revision.
 Updates preserve unspecified fields; `--body ""` clears the description.
@@ -84,26 +102,96 @@ Local writes update the read model incrementally. Separate CLI and daemon
 processes share the indexed ref, and conflicting writes return errors rather
 than overwrite one another.
 
-No network synchronization happens automatically:
+### Automatic sharing
+
+The daemon synchronizes at startup, immediately after local mutations, and every
+15 seconds to import co-workers' changes and retry unpublished data. HTTP issue
+writes do **not** wait for the network. A slow, offline, unauthenticated, or
+read-only remote does not prevent saving to local Git. The metadata branch itself
+is the durable queue: pending commits are rediscovered on restart.
+
+The UI distinguishes **local only**, **sharing pending**, **sharing**, **shared**,
+**sharing failed**, and **conflicting edits**. "Saved locally" never means a
+co-worker can already see the issue. Use **Retry sharing** to request another
+attempt immediately. The UI refreshes pending status quickly and periodically
+refreshes issue records; incoming remote changes are eventually visible, not
+instantaneous notifications.
+
+Synchronization fetches only the metadata branch, validates incoming records,
+fast-forwards where possible, and creates a two-parent metadata merge for
+independent file changes. Separate initial histories are supported. A remote
+push is an ordinary fast-forward push of an explicit commit snapshot; a racing
+push is rejected and retried after fetching again. gitsnow never force-pushes
+over a co-worker's history. Application `HEAD`, staged files, working trees, and
+`FETCH_HEAD` are left alone.
+
+Teammates can browse `gitsnow/meta` and `issues/<id>.md` in the forge's branch/file
+browser without installing gitsnow. These records do **not** appear in the forge's
+native Issues tab; that requires a future forge issue backend.
+
+### Configuration and manual retry
+
+The default synchronization remote is `origin` when it exists. Configuration
+is private to the clone, stored as `gitsnow.syncRemote` in local Git config.
+Changing it does not impose a setting on teammates.
 
 ```sh
-git push origin gitsnow/meta
+# Select an existing remote and share pending records now.
+./gitsnow sync --repo /path/to/repo --remote team
+
+# Disable automatic sharing and network access.
+./gitsnow sync --repo /path/to/repo --remote off
+
+# Re-enable automatic sharing through origin.
+./gitsnow sync --repo /path/to/repo --remote origin
+
+# Retry immediately and print sharing status as JSON.
+./gitsnow sync --repo /path/to/repo
+
+# Customize daemon polling.
+./gitsnow serve --repo /path/to/repo --sync-interval 30s
 ```
 
-Teammates can continue using the application branch without adopting gitsnow.
-In a fresh clone that has fetched this branch, explicitly create its local
-tracking branch before starting gitsnow:
+The minimum poll interval is 1 second; the default is 15 seconds. Each network
+attempt is bounded to 30 seconds and retries continue only while the daemon
+runs. One-shot CLI commands attempt synchronization once. Disabling sharing
+does not delete records already published; re-enabling it will share all pending
+local metadata.
+
+Use an existing credential helper or SSH agent. gitsnow does not offer a Git
+login flow, and background Git commands do not prompt for credentials. SSH uses
+batch mode and a connection timeout by default; an explicit `GIT_SSH_COMMAND`
+is honored. The selected remote must have one identical effective fetch and
+push URL, to avoid importing from one repository and silently publishing to
+another or to multiple destinations. Configure a dedicated remote if needed.
+
+### Concurrent edits
+
+Different issue files merge automatically. If both clones change the **same
+record**, or one edits a record while another deletes it, sharing stops with an
+explicit conflict and the affected paths. This is record-level reconciliation,
+not line-based Markdown merging or last-write-wins. The local branch and remote
+branch are unchanged; an incoming conflict snapshot is also retained locally
+under `refs/gitsnow/conflicts/<commit>`.
+
+There is not yet an in-app cross-clone conflict resolver. Reconcile in a separate
+metadata worktree, preserving the application checkout. Managed writes and
+synchronization are refused while that branch is checked out, so the daemon
+cannot move it underneath a manual edit:
 
 ```sh
-git branch --track gitsnow/meta origin/gitsnow/meta
+./gitsnow sync --repo /path/to/repo --remote off
+git -C /path/to/repo fetch origin
+git -C /path/to/repo worktree add /path/to/metadata-worktree gitsnow/meta
+git -C /path/to/metadata-worktree merge --no-commit --allow-unrelated-histories origin/gitsnow/meta
+# Review both versions, resolve the conflicting records, git add, and git commit.
+git -C /path/to/repo worktree remove /path/to/metadata-worktree
+./gitsnow sync --repo /path/to/repo --remote origin
 ```
 
-gitsnow rejects a missing local metadata branch when a fetched remote-tracking
-one exists, rather than silently creating a competing empty history.
-To bring in remote metadata changes, fetch them and explicitly fast-forward or
-reconcile the metadata branch. Automatic multi-clone reconciliation is not
-implemented; divergent histories must not be resolved with a force push.
-Deletion removes the current record, but **does not erase Git history**.
+Use the selected remote instead of `origin` when configured differently. Never
+force-push to resolve this. Deletion removes the current record, but **does not
+erase Git history**.
 
 The browser caches confirmed issue records in local storage, scoped to the last
 repository served at that origin. Cached records can be read while disconnected,
@@ -125,7 +213,8 @@ React UI -> HTTP API -> issue domain -> Git metadata backend
 
 The implementation starts as a Go modular monolith:
 
-- `internal/issues`: domain validation, Git persistence, SQLite indexing.
+- `internal/issues`: domain validation, Git persistence, SQLite indexing, and
+  background metadata synchronization with durable sharing status.
 - `internal/server`: bounded JSON API and localhost/same-origin protections.
 - `cmd/gitsnow`: direct CLI operations and daemon lifecycle.
 - `web`: responsive React/TypeScript UI, optimistic operations, browser cache.
@@ -185,6 +274,7 @@ go test ./internal/issues -run '^$' -bench BenchmarkCachedList1000 -benchtime=10
 | Method | Path | Result |
 |--------|------|--------|
 | GET | `/api/repository` | Repository path, metadata ref, backend |
+| POST | `/api/sync` | Request background sharing; HTTP 202 with sharing status |
 | GET | `/api/issues?status=open&q=text` | `{ "issues": [...] }` |
 | POST | `/api/issues` | Create `{ id?, title, body, status? }` |
 | GET | `/api/issues/{id}` | Read an issue |
@@ -197,6 +287,12 @@ Send `X-Gitsnow-Repository` with the path returned by `/api/repository` to rejec
 requests if the daemon has switched repositories. The browser sends this header
 for issue reads and writes. Errors have the shape
 `{ "error": { "code": "...", "message": "..." } }`; conflicts return HTTP 409.
+
+`/api/repository` includes a `sync` object with `state`, `remote`, `message`,
+optional `lastSuccess` and `syncedRevision`, and conflict paths. It reads local
+status only and never waits for a fetch or push. A remote synchronization error
+does not turn a successfully persisted HTTP issue mutation into a failed save;
+clients must check sharing status separately.
 
 Issue bodies are limited to 1 MiB and request bodies to 2 MiB. Internal operation
 errors are logged by the daemon; clients must reload to reconcile before retrying

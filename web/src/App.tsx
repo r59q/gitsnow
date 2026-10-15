@@ -7,6 +7,7 @@ import {
   getRepository,
   listIssues,
   readCache,
+  requestSync,
   saveIssue,
   writeCache,
 } from "./api";
@@ -24,6 +25,8 @@ export function App() {
   const [ready, setReady] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [busy, setBusy] = useState<string>();
+  const [retryingSync, setRetryingSync] = useState(false);
+  const [syncError, setSyncError] = useState<string>();
   const [status, setStatus] = useState<"all" | Issue["status"]>("open");
   const [search, setSearch] = useState("");
   const [editor, setEditor] = useState<Editor>();
@@ -51,6 +54,7 @@ export function App() {
       setIssues(records);
       setReady(true);
       setError(undefined);
+      setSyncError(undefined);
       persist(repo, records);
     } catch (error) {
       if (current !== generation.current || controller.signal.aborted) return;
@@ -77,6 +81,12 @@ export function App() {
     };
   }, [refresh]);
 
+  useEffect(() => {
+    if (!ready || busy || !repository?.sync || !["pending", "syncing"].includes(repository.sync.state)) return;
+    const timer = window.setTimeout(() => { void refresh(); }, 1000);
+    return () => window.clearTimeout(timer);
+  }, [repository?.sync, ready, busy, refresh]);
+
   async function mutate(optimistic: Issue[], id: string, operation: () => Promise<Issue[]>, message: string) {
     if (mutation.current || !ready || !repository) return false;
     const previous = issues;
@@ -91,7 +101,19 @@ export function App() {
     try {
       const records = await operation();
       setIssues(records);
-      persist(repository, records);
+      let savedRepository = repository;
+      if (repository.sync?.remote && !["error", "conflict"].includes(repository.sync.state)) {
+        savedRepository = {
+          ...repository,
+          sync: {
+            ...repository.sync,
+            state: "pending",
+            message: "Saved locally; waiting to share with " + repository.sync.remote,
+          },
+        };
+      }
+      setRepository(savedRepository);
+      persist(savedRepository, records);
       setNotice(message);
       return true;
     } catch (error) {
@@ -122,7 +144,7 @@ export function App() {
     const succeeded = await mutate(records, id, async () => {
       const saved = await saveIssue({ ...input, ...(editor.issue ? {} : { id }) }, editor.repositoryPath, editor.issue?.id);
       return records.map((issue) => issue.id === id ? saved : issue);
-    }, "Issue saved to Git.");
+    }, "Issue saved locally." + (repository?.sync?.remote ? " Remote sharing is tracked below." : ""));
     if (succeeded) setEditor(undefined);
   }
 
@@ -146,6 +168,21 @@ export function App() {
     });
   }
 
+  async function retrySync() {
+    if (!repository || !ready) return;
+    const path = repository.path;
+    setRetryingSync(true);
+    setSyncError(undefined);
+    try {
+      const sync = await requestSync(path);
+      setRepository((current) => current?.path === path ? { ...current, sync } : current);
+    } catch (error) {
+      setSyncError(`Could not request sharing: ${errorMessage(error)}`);
+    } finally {
+      setRetryingSync(false);
+    }
+  }
+
   const query = search.trim().toLocaleLowerCase();
   const visible = issues.filter((issue) =>
     (status === "all" || issue.status === status) &&
@@ -153,14 +190,20 @@ export function App() {
   );
   const repoName = repository?.path.split("/").filter(Boolean).at(-1);
   const openCount = issues.filter((issue) => issue.status === "open").length;
+  const sync = repository?.sync;
+  const sharingBlocked = sync?.state === "error" || sync?.state === "conflict";
 
   return (
     <div className="app">
       <header className="topbar">
         <a className="wordmark" href="/">git<span>snow</span><span className="alpha">early access</span></a>
-        <span className={`connection ${ready ? "connected" : ""}`}>
+        <span className={`connection ${ready && !sharingBlocked ? "connected" : ""}`}>
           <span className="connection-dot" />
-          {busy ? "Saving to Git" : refreshing ? "Synchronizing" : ready ? "Local Git backend" : "Unverified / cached"}
+          {busy ? "Saving locally" : !ready ? "Unverified / cached" :
+            sync?.state === "synced" ? `Shared with ${sync.remote}` :
+              sync?.state === "syncing" ? "Sharing metadata" :
+                sync?.state === "pending" ? "Sharing pending" :
+                  sharingBlocked ? "Saved locally / not shared" : "Local Git backend"}
         </span>
       </header>
 
@@ -180,6 +223,18 @@ export function App() {
         </div>
 
         <div className="messages" aria-live="polite">
+          {sync && <div className={`message ${sharingBlocked ? "warning" : sync.state === "synced" ? "success" : "sharing"}`} role="status">
+            <div>
+              <strong>{!ready ? "Last known sharing status" : sync.state === "local_only" ? "Local only" :
+                sync.state === "synced" ? `Shared with ${sync.remote}` : "Saved locally / sharing pending"}</strong>
+              <div>{sync.message}</div>
+              {sync.conflicts?.length ? <div className="conflict-paths">{sync.conflicts.join(", ")}</div> : null}
+            </div>
+            {sync.remote && <button disabled={!ready || !!busy || retryingSync || sync.state === "syncing"} onClick={() => { void retrySync(); }}>
+              {retryingSync ? "Requesting..." : "Retry sharing"}
+            </button>}
+          </div>}
+          {syncError && <div className="message error" role="alert">{syncError}</div>}
           {error && <div className="message error" role="alert">
             <span>{error}</span>
             <button disabled={!!busy || refreshing} onClick={() => { void refresh(); }}>Reload</button>
@@ -229,7 +284,7 @@ export function App() {
           )}
           <footer className="board-footer">
             <span>{visible.length} {visible.length === 1 ? "issue" : "issues"}</span>
-            <span>{ready ? "Persisted on gitsnow/meta" : "Cached records are read-only until synchronized"}</span>
+            <span>{ready ? sync?.state === "synced" ? `Shared on ${sync.remote}` : "Saved locally on gitsnow/meta" : "Cached records are read-only until synchronized"}</span>
           </footer>
         </section>
 
@@ -349,7 +404,7 @@ function IssueEditor({ issue, latestIssue, saving, writable, refreshing, error, 
             </details>
             <button type="button" className="secondary" disabled={!writable} onClick={() => setRevision(latestIssue.revision)}>Apply draft to latest revision</button>
           </div>}
-          <p className="editor-note">{saving ? "Pending: writing to the Git metadata branch..." : "Saved as Markdown on gitsnow/meta. Your application files stay untouched."}</p>
+          <p className="editor-note">{saving ? "Pending: writing to the local Git metadata branch..." : "Saved locally as Markdown on gitsnow/meta. Remote sharing is separate; your application files stay untouched."}</p>
           <div className="editor-actions">
             {issue && <button type="button" className="danger-link" disabled={saving || !writable} onClick={() => setConfirmDelete(true)}>Delete issue</button>}
             <button type="button" className="secondary" disabled={saving} onClick={onClose}>Cancel</button>

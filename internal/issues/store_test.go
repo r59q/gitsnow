@@ -226,7 +226,7 @@ func TestLinkedWorktreesShareMetadata(t *testing.T) {
 	}
 }
 
-func TestFreshCloneRequiresExplicitMetadataTracking(t *testing.T) {
+func TestFreshCloneAdoptsFetchedMetadata(t *testing.T) {
 	store, root := testStore(t)
 	ctx := context.Background()
 	gitTest(t, root, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "--allow-empty", "-qm", "Application")
@@ -236,13 +236,6 @@ func TestFreshCloneRequiresExplicitMetadataTracking(t *testing.T) {
 	}
 	clone := filepath.Join(t.TempDir(), "clone")
 	gitTest(t, root, "clone", "-q", root, clone)
-	if unexpected, err := Open(ctx, clone); err == nil {
-		unexpected.Close()
-		t.Fatal("silently initialized empty metadata despite a fetched metadata branch")
-	} else if !strings.Contains(err.Error(), "tracking branch") {
-		t.Fatal(err)
-	}
-	gitTest(t, clone, "branch", "--track", "gitsnow/meta", "origin/gitsnow/meta")
 	other, err := Open(ctx, clone)
 	if err != nil {
 		t.Fatal(err)
